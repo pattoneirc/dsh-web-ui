@@ -133,15 +133,17 @@ declare module '@deepseek-ai/cordis' {
 
 /**
  * Required services (fiber inject waiting — the runtime must be up first).
- * The generated remote faces are probed at use time instead of injected:
- * `remote.agentPresets` only registers on 0.1.2-alpha.2 hosts (the
- * api-remotes contribution), so a hard wait would pend the entry forever
- * on hosts below that cohort, which serve the same roster through the
- * connection RPC face.
+ * The generated remote namespaces are not all hard injects: `remote.session`
+ * is one, while `remote.agentPresets` is reached through a scoped inject at
+ * use time (see mountUi), because the namespace mounts with the official
+ * api-remotes assembly applied beside this entry rather than before it.
  */
 export const inject = ['slots', 'sessions', 'workspaces', 'connection', 'configForms', 'locale', 'remote', 'remote.session', 'uiWorkspace', 'layout']
 
-/** One agent-preset row the mode picker consumes (either face's wire shape). */
+/** The generated Remote namespace the mode picker reads its roster from. */
+type PresetRemote = ClientRemote['agentPresets']
+
+/** One agent-preset row the mode picker consumes. */
 interface PresetRosterRow {
   id: string
   name?: string
@@ -152,41 +154,17 @@ interface PresetRosterRow {
 }
 
 /**
- * Read the agent-preset roster through whichever face the running host
- * serves: the generated api-remotes face (`remote.agentPresets`,
- * 0.1.2-alpha.2) or the connection RPC face
- * (`connection.api.agentPresets`, hosts below that cohort). Answers
- * undefined when the host serves neither, so the caller leaves the picker
- * options untouched instead of erroring.
+ * Read the agent-preset roster through the generated api-remotes face. The
+ * caller passes the namespace resolved inside its scoped inject, so a host
+ * that serves no such namespace never reaches here; a host that serves it
+ * answers `ok: false` instead, which leaves the picker options untouched.
+ * @param remote - the `remote.agentPresets` namespace.
+ * @returns the roster, or a failed read the caller ignores.
  */
-async function readPresetRoster(
-  ctx: ClientContext,
-  remote: ClientRemote,
-): Promise<{ ok: boolean; presets: readonly PresetRosterRow[] } | undefined> {
-  // The cordis `remote` proxy throws on a property that was never injected
-  // ("cannot get property X without inject") rather than returning undefined,
-  // so the probe must guard the access — a hard read would abort mounting on
-  // hosts below the 0.1.2-alpha.2 cohort instead of degrading to the legacy
-  // connection RPC face below.
-  let remotes: ClientRemote['agentPresets'] | undefined
-  try {
-    remotes = (remote as Partial<ClientRemote>).agentPresets
-  } catch {
-    remotes = undefined
-  }
-  if (remotes !== undefined) {
-    const response = await remotes.list()
-    if (!response.ok) return { ok: false, presets: [] }
-    return { ok: true, presets: response.value.presets }
-  }
-  const connection = ctx.get('connection') as unknown as {
-    api?: { agentPresets?: { list(request: Record<string, never>): Promise<{ result: { ok: boolean; value?: { presets?: readonly PresetRosterRow[] } } }> } }
-  }
-  const legacy = connection.api?.agentPresets
-  if (legacy === undefined) return undefined
-  const response = await legacy.list({})
-  if (!response.result.ok || response.result.value === undefined) return { ok: false, presets: [] }
-  return { ok: true, presets: response.result.value.presets ?? [] }
+async function readPresetRoster(remote: PresetRemote): Promise<{ ok: boolean; presets: readonly PresetRosterRow[] }> {
+  const response = await remote.list()
+  if (!response.ok) return { ok: false, presets: [] }
+  return { ok: true, presets: response.value.presets }
 }
 
 /**
@@ -321,10 +299,10 @@ export function apply(ctx: ClientContext): void {
       const created = await workspaces.create({ path })
       return { workspaceId: created.workspaceId }
     })
-    const pushPresetOptions = async (): Promise<void> => {
+    const pushPresetOptions = async (presetRemote: PresetRemote): Promise<void> => {
       try {
-        const roster = await readPresetRoster(ctx, remote)
-        if (roster === undefined || !roster.ok) return
+        const roster = await readPresetRoster(presetRemote)
+        if (!roster.ok) return
         controller.setExecutionOptions({
           presets: roster.presets.map(preset => ({
             id: preset.id,
@@ -340,6 +318,25 @@ export function apply(ctx: ClientContext): void {
         console.error('[dsh-task-board] agent preset roster read failed', error)
       }
     }
+    // The roster namespace mounts with the official api-remotes assembly,
+    // which the page applies beside this entry: at mount time the namespace is
+    // usually still absent, and reading it through `remote.agentPresets`
+    // before it lands throws ("cannot get property ... without inject"), so a
+    // one-shot probe leaves the mode picker with nothing but "inherit" for the
+    // page lifetime. A hard inject is no better — it would pend the whole
+    // board on a deployment that never mounts the namespace. The scoped inject
+    // runs the feed exactly when the namespace exists and re-runs it if the
+    // namespace is replaced; the reconnect read inside covers a deployment
+    // change behind the same namespace.
+    const presetRosterFeed = ctx.inject(['remote.agentPresets'], (inner) => {
+      const presetRemote = inner.get('remote.agentPresets') as PresetRemote | undefined
+      if (presetRemote === undefined) return
+      void pushPresetOptions(presetRemote)
+      // Subscribed inside the injected scope, so a namespace that goes away
+      // takes its listener with it instead of leaving one per remount.
+      return inner.on('connection/reset', () => { void pushPresetOptions(presetRemote) })
+    })
+    disposers.push(() => { void presetRosterFeed.dispose() })
     const pushModelOptions = async (): Promise<void> => {
       try {
         let models: Array<{ id: string; name?: string; provider?: string }> = []
@@ -404,12 +401,8 @@ export function apply(ctx: ClientContext): void {
         console.error('[dsh-task-board] model options read failed', error)
       }
     }
-    void pushPresetOptions()
     void pushModelOptions()
-    disposers.push(ctx.on('connection/reset', () => {
-      void pushPresetOptions()
-      void pushModelOptions()
-    }))
+    disposers.push(ctx.on('connection/reset', () => { void pushModelOptions() }))
     // Native panel surfaces: one sidebar row and one center-column page, both
     // through the official slot seats the shell itself renders. The layout's
     // panel selection is reconciled back into the controller so the board's own

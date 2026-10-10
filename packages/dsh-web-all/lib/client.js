@@ -17575,11 +17575,10 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 		];
 		/**
 		* Required services (fiber inject waiting — the runtime must be up first).
-		* The generated remote faces are probed at use time instead of injected:
-		* `remote.agentPresets` only registers on 0.1.2-alpha.2 hosts (the
-		* api-remotes contribution), so a hard wait would pend the entry forever
-		* on hosts below that cohort, which serve the same roster through the
-		* connection RPC face.
+		* The generated remote namespaces are not all hard injects: `remote.session`
+		* is one, while `remote.agentPresets` is reached through a scoped inject at
+		* use time (see mountUi), because the namespace mounts with the official
+		* api-remotes assembly applied beside this entry rather than before it.
 		*/
 		const inject$11 = [
 			"slots",
@@ -17594,41 +17593,22 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 			"layout"
 		];
 		/**
-		* Read the agent-preset roster through whichever face the running host
-		* serves: the generated api-remotes face (`remote.agentPresets`,
-		* 0.1.2-alpha.2) or the connection RPC face
-		* (`connection.api.agentPresets`, hosts below that cohort). Answers
-		* undefined when the host serves neither, so the caller leaves the picker
-		* options untouched instead of erroring.
+		* Read the agent-preset roster through the generated api-remotes face. The
+		* caller passes the namespace resolved inside its scoped inject, so a host
+		* that serves no such namespace never reaches here; a host that serves it
+		* answers `ok: false` instead, which leaves the picker options untouched.
+		* @param remote - the `remote.agentPresets` namespace.
+		* @returns the roster, or a failed read the caller ignores.
 		*/
-		async function readPresetRoster(ctx, remote) {
-			let remotes;
-			try {
-				remotes = remote.agentPresets;
-			} catch {
-				remotes = void 0;
-			}
-			if (remotes !== void 0) {
-				const response = await remotes.list();
-				if (!response.ok) return {
-					ok: false,
-					presets: []
-				};
-				return {
-					ok: true,
-					presets: response.value.presets
-				};
-			}
-			const legacy = ctx.get("connection").api?.agentPresets;
-			if (legacy === void 0) return void 0;
-			const response = await legacy.list({});
-			if (!response.result.ok || response.result.value === void 0) return {
+		async function readPresetRoster(remote) {
+			const response = await remote.list();
+			if (!response.ok) return {
 				ok: false,
 				presets: []
 			};
 			return {
 				ok: true,
-				presets: response.result.value.presets ?? []
+				presets: response.value.presets
 			};
 		}
 		/**
@@ -17707,10 +17687,10 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 				controller.setWorkspaceCreator(async (path) => {
 					return { workspaceId: (await workspaces.create({ path })).workspaceId };
 				});
-				const pushPresetOptions = async () => {
+				const pushPresetOptions = async (presetRemote) => {
 					try {
-						const roster = await readPresetRoster(ctx, remote);
-						if (roster === void 0 || !roster.ok) return;
+						const roster = await readPresetRoster(presetRemote);
+						if (!roster.ok) return;
 						controller.setExecutionOptions({ presets: roster.presets.map((preset) => ({
 							id: preset.id,
 							name: preset.name,
@@ -17722,6 +17702,17 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 						console.error("[dsh-task-board] agent preset roster read failed", error);
 					}
 				};
+				const presetRosterFeed = ctx.inject(["remote.agentPresets"], (inner) => {
+					const presetRemote = inner.get("remote.agentPresets");
+					if (presetRemote === void 0) return;
+					pushPresetOptions(presetRemote);
+					return inner.on("connection/reset", () => {
+						pushPresetOptions(presetRemote);
+					});
+				});
+				disposers.push(() => {
+					presetRosterFeed.dispose();
+				});
 				const pushModelOptions = async () => {
 					try {
 						let models = [];
@@ -17777,10 +17768,8 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 						console.error("[dsh-task-board] model options read failed", error);
 					}
 				};
-				pushPresetOptions();
 				pushModelOptions();
 				disposers.push(ctx.on("connection/reset", () => {
-					pushPresetOptions();
 					pushModelOptions();
 				}));
 				try {
