@@ -30,7 +30,7 @@ import type {
   SessionPreviewView,
   WorkspaceView,
 } from '../core/types.ts'
-import { buildInventory, ledgerEntryFor, readProjcacheIndex, type InventorySources, type ProjcacheFileEntry } from './inventory.ts'
+import { buildInventory, ledgerEntryFor, readProjcacheIndex, type InventorySources, type ProjcacheFileEntry, type ProjcacheIndex } from './inventory.ts'
 import {
   capEntries,
   deserializeAutoState,
@@ -40,6 +40,7 @@ import {
   type LedgerDocument,
 } from './ledger.ts'
 import { DirIndexCache } from './dir-index-cache.ts'
+import { TtlMemo } from './ttl-memo.ts'
 import { canonicalSessionId, deleteRdbSession, indexSessionDirs, isSessionRdb, rdbDbPaths, removeSessionDir } from './session-files.ts'
 import { dshHome as resolveDshHome } from '../dsh-home.ts'
 import { archiveSession, removeFromWorkspaceRows, unarchiveSessions, unarchiveSeamAvailable } from './workspace-store.ts'
@@ -83,6 +84,15 @@ const PREVIEW_TEXT_CAP = 400
  */
 const DIR_INDEX_TTL_MS = 2_000
 
+/**
+ * How long one parse of the projection-cache index may be reused. The index is
+ * re-read and re-parsed in full by every inventory pass, and one action issues
+ * several passes, so the same burst window as the directory scan applies; once
+ * the walk is reused the parse is what is left of a warm pass. The service
+ * invalidates the memo itself after the delete pipeline rewrites the index.
+ */
+const PROJCACHE_INDEX_TTL_MS = 2_000
+
 export class ArchiveService {
   private readonly ctx: Context
   private readonly dshHome: string
@@ -103,6 +113,17 @@ export class ArchiveService {
   private readonly dirIndex = new DirIndexCache({
     ttlMs: DIR_INDEX_TTL_MS,
     scan: () => indexSessionDirs(join(this.dshHome, 'sessions')),
+  })
+  /**
+   * Parsed projection-cache index reused across nearby inventory passes. The
+   * harness file only changes when another writer touches it, while every pass
+   * re-reads and re-parses the whole document; the delete pipeline invalidates
+   * the memo after it rewrites the index, so a removed session's facts cannot
+   * resurface from memory.
+   */
+  private readonly projcacheIndex = new TtlMemo<ProjcacheIndex>({
+    ttlMs: PROJCACHE_INDEX_TTL_MS,
+    load: () => readProjcacheIndex(this.dshHome),
   })
 
   private loaded = false
@@ -200,6 +221,7 @@ export class ArchiveService {
       ledger: this.ledger,
       projcacheFiles: this.projcacheFiles,
       dirIndex: this.dirIndex.get(),
+      projcacheIndex: this.projcacheIndex.get(),
     }
   }
 
@@ -511,6 +533,10 @@ export class ArchiveService {
   /** Best-effort projection-cache scrub; a stale cache entry is cosmetic. */
   private async scrubProjcache(ids: ReadonlySet<string>, nativeIds: Record<string, string> = {}): Promise<void> {
     const indexPath = join(this.dshHome, 'storages', 'session_projcache.json')
+    // The index this pass rewrites is the memo's input: drop the retained parse
+    // first, so a pass that follows a physical delete cannot answer with the
+    // removed sessions' facts even while the window is still open.
+    if (ids.size > 0) this.projcacheIndex.invalidate()
     try {
       if (existsSync(indexPath)) {
         const parsed = JSON.parse(this.readSync(indexPath)) as { tables?: { sessions?: Record<string, unknown> } }

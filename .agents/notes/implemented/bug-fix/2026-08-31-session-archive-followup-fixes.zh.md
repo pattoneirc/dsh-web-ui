@@ -132,3 +132,12 @@ DSH 进程持有（活跃 SessionStore 成员）。批量对话框确实报告�
 - **为 `preview()` 单独做一份缓存文档**：在扫描复用落地后重新测量并否决——preview 走的是同一个 `sources()`，已共享该次遍历与按 id 的事实记忆。它剩余的 31.7 ms 冷成本是 444 个会话一次性读取投影缓存事实，付过一次之后即 0.7 ms；再做一个缓存只会重复记忆第一层已经摊薄掉的开销。
 
 **后果。** 外部删除后，大小与目录映射最多滞后 2 秒；服务自身的删除立即失效。`preview()` 仍自行装配清单，留待后续再收敛。验证：包内 14 个测试文件 / 104 个用例通过，两个 program 的 typecheck 与 build 通过，`test:standards`、`docs:check`、`i18n:check`、`emoji:check`、`sync-shared --check` 通过。新增覆盖 `tests/dir-index-cache.spec.ts` 共 5 例：窗口内多次装配只扫描一次、窗口过期后重新扫描、显式失效后被删除的存储消失、窗口过后能发现新增目录，以及自行遍历与接受索引得到完全相同的行。反向对照：把 `invalidate()` 改成空实现会让失效用例失败，忽略 TTL 会让两个用例失败。属 host 半区改动，需用户重启 DSH 服务后才会作用到 GUI。
+## 后续 4（同日）：同一份有界记忆也服务于投影缓存索引
+
+**问题。** 每次装配都会完整读取聚合投影缓存索引（`storages/session_projcache.json`）——一次 `readFileSync` 加一次对整份文档的 `JSON.parse`——而它旁边规模大得多的 sessions 根目录遍历已由一份有界记忆承担。对该索引文件做规模扫描测得这次读取加解析为 3.66 µs/KiB（R² = 0.943）；在维护者这台机器的 112 KB 索引上约为每次装配 0.40 ms，相当于冷装配的 1.2%、热装配的 36%——也就是目录遍历已由记忆承担的那一次装配。这笔收益是**亚毫秒级**的，此处如实记录：它值得移除，是因为它与遍历的记忆所移除的是同一类重复工作，且正好落在一次用户操作会重复的那些装配上。
+
+**决策。** 一种记忆类型同时服务两处读取。`ttl-memo.ts` 拥有 `TtlMemo`：单条目、一个 TTL 窗口，以及由拥有者显式调用的失效。`DirIndexCache` 是该类型针对 sessions 根目录扫描的特化，公开面不变；`ArchiveService` 另持一份用于投影缓存索引的记忆，并在 `sources()` 中经 `InventorySources.projcacheIndex` 注入。`scrubProjcache()`——索引文件的唯一改写点——在确实改写了内容时（`ids.size > 0`）失效该记忆。未注入记忆时 `buildInventory` 仍自行调用 `readProjcacheIndex`，因此无论有没有服务，该次装配的契约不变。
+
+**后果。** 一次装配读到的索引最多滞后一个 TTL 窗口；删除管线自身的改写会立即失效，因此被清理掉的标题不会活到下一次清单装配。每份记忆只持一个条目，不累积、不轮询。覆盖：`tests/projcache-index-memo.spec.ts`。
+
+**反向对照。** 去掉注入会让守护报 `expected ['Amended','Beta'] to deeply equal ['Alpha','Beta']`；去掉失效会让被删除的标题复活：`expected 'Doomed' to be undefined`。

@@ -11,12 +11,14 @@
  * Reuse is only sound while the tree has not changed underneath us, so the
  * window is short and the owner must invalidate explicitly after it removes
  * session storage itself. Nothing here polls or accumulates: one entry, and a
- * scan is always one call away.
+ * scan is always one call away. The window rule itself lives in
+ * {@link TtlMemo}, which the projection-cache index memo shares.
  *
  * @module @linxin666/dsh-session-archive/host/dir-index-cache
  */
 
 import type { SessionDirIndex } from './session-files.ts'
+import { TtlMemo } from './ttl-memo.ts'
 
 /** Collaborators of one cache instance. */
 export interface DirIndexCacheOptions {
@@ -34,36 +36,24 @@ export interface DirIndexCacheOptions {
  * next read to rescan (the owner calls it after its own removals).
  */
 export class DirIndexCache {
-  private readonly ttlMs: number
-  private readonly scan: () => SessionDirIndex
-  private readonly now: () => number
-  private entry: { at: number; index: SessionDirIndex } | undefined
-  private scanCount = 0
+  private readonly memo: TtlMemo<SessionDirIndex>
 
   constructor(options: DirIndexCacheOptions) {
-    this.ttlMs = options.ttlMs
-    this.scan = options.scan
-    this.now = options.now ?? (() => Date.now())
+    this.memo = new TtlMemo({ ttlMs: options.ttlMs, load: options.scan, now: options.now })
   }
 
   /** The current index: the retained scan while it is fresh, else a new one. */
   get(): SessionDirIndex {
-    const at = this.now()
-    const entry = this.entry
-    if (entry !== undefined && at - entry.at < this.ttlMs && at >= entry.at) return entry.index
-    const index = this.scan()
-    this.scanCount += 1
-    this.entry = { at, index }
-    return index
+    return this.memo.get()
   }
 
   /** Drop the retained scan; the next {@link get} rescans. */
   invalidate(): void {
-    this.entry = undefined
+    this.memo.invalidate()
   }
 
   /** Number of real scans this instance performed; diagnostics for tests. */
   get scans(): number {
-    return this.scanCount
+    return this.memo.loads
   }
 }

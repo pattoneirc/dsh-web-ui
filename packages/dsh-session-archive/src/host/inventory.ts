@@ -56,6 +56,14 @@ export interface InventorySources {
    * means this pass walks the tree itself.
    */
   dirIndex?: SessionDirIndex
+  /**
+   * Optional parsed projection-cache index. The service passes one for the
+   * same reason as {@link dirIndex}: every pass would otherwise re-read and
+   * re-parse the whole index document, which is the dominant remaining cost of
+   * a pass whose directory walk was already reused; absent means this pass
+   * reads and parses the file itself.
+   */
+  projcacheIndex?: ProjcacheIndex
 }
 
 /** Enrichment facts from one per-session projection-cache file. */
@@ -66,13 +74,17 @@ export interface ProjcacheFileEntry {
 }
 
 /** Title/createdAt/cwd enrichment rows from the harness projection cache. */
-interface ProjcacheIndex {
+export interface ProjcacheIndex {
   sessions: Record<string, {
     identity?: { createdAt?: number; cwd?: string }
     rows?: { title?: { val?: unknown }; goal?: { val?: unknown } }
   }>
 }
 
+/**
+ * Read and parse the aggregate projection-cache index. A missing or
+ * unparseable file degrades to an empty index rather than failing the pass.
+ */
 export function readProjcacheIndex(dshHome: string): ProjcacheIndex {
   const path = join(dshHome, 'storages', 'session_projcache.json')
   if (!existsSync(path)) return { sessions: {} }
@@ -218,7 +230,7 @@ export async function buildInventory(sources: InventorySources, signal: AbortSig
   const dirIndex = sources.dirIndex ?? indexSessionDirs(join(sources.dshHome, 'sessions'))
   for (const id of dirIndex.byId.keys()) add(id).hasDir = true
 
-  const projcache = readProjcacheIndex(sources.dshHome)
+  const projcache = sources.projcacheIndex ?? readProjcacheIndex(sources.dshHome)
   for (const [id, entry] of Object.entries(projcache.sessions)) {
     const draft = drafts.get(id)
     if (draft === undefined) continue
