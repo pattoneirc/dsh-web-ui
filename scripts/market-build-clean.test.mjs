@@ -1,6 +1,6 @@
-import test from 'node:test'
+import test, { before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -34,8 +34,7 @@ const COMMUNITY_DIR = resolveFamilyPackage('@linxin666/dsh-client-ui-community-p
  * rebuild it). market-build --check in such a tree must succeed after the
  * dist was committed by the same sources, and must still reject tampering.
  */
-function fixture() {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-market-clean-'))
+function copyCommittedTree(dir) {
   const pairs = [
     [join(ROOT, 'scripts', 'market-build'), join(dir, 'scripts', 'market-build')],
     // The pin guard imports this to compare the cache against the gitlinks.
@@ -66,19 +65,191 @@ function fixture() {
   }
   // Resolve the skin-center lib imports exactly as a pnpm checkout would.
   // A workspace link keeps its dependencies inside the package; a registry
-  // install keeps them beside it in the pnpm store.
+  // install keeps its dependencies beside it in the pnpm store.
   symlinkSync(
     existsSync(join(SKIN_CENTER_DIR, 'node_modules'))
       ? join(SKIN_CENTER_DIR, 'node_modules')
       : dirname(dirname(SKIN_CENTER_DIR)),
     join(dir, 'packages', 'skins', 'skin-center', 'node_modules'),
   )
+}
+
+/**
+ * The expensive step is materializing the committed tree byte for byte, and the
+ * cost sits in the fetched content cache rather than in the dist: measured on
+ * the development machine, `.market-inputs/{pet,community,presets}` is 35421
+ * files (6.3-7.9s), `market/dist` is 4678 files / 519MB (1.3s), and
+ * `market-build --check` itself is about 2s. One tree therefore serves every
+ * case, and each case declares the paths it touches so the tree is put back
+ * before the next case runs.
+ */
+/** How many times the cases below do something that costs a full traversal. */
+const materializations = { shared: 0, distOnly: 0 }
+
+function newFixtureDir() {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-market-clean-'))
+  materializations.shared += 1
+  copyCommittedTree(dir)
   return dir
+}
+
+let sharedDir = null
+let sharedStamp = null
+
+/**
+ * A path's identity: its kind, its byte size, or the symlink target. Sizes keep
+ * the snapshot a single stat walk — hashing 41k fixture files would cost more
+ * than the sharing saves.
+ */
+function stampOf(abs) {
+  const stat = lstatSync(abs)
+  if (stat.isSymbolicLink()) return 'symlink:' + readlinkSync(abs)
+  if (stat.isDirectory()) return 'dir'
+  return 'file:' + stat.size
+}
+
+/**
+ * Every path under a tree, keyed relative to it: its identity stamp plus its
+ * timestamp. Symlinks are leaves. Timestamps are recorded per path rather than
+ * compared to one clock reading, because the copy that builds the fixture stamps
+ * its last files with a sub-millisecond-precision mtime that a millisecond
+ * `Date.now()` would read as newer.
+ */
+function stampTree(root) {
+  const out = new Map()
+  const walk = (abs, base) => {
+    for (const name of readdirSync(abs).sort()) {
+      const p = join(abs, name)
+      const rel = base ? base + '/' + name : name
+      const stat = lstatSync(p)
+      const isLink = stat.isSymbolicLink()
+      out.set(rel, { stamp: stampOf(p), mtimeMs: stat.mtimeMs })
+      if (!isLink && stat.isDirectory()) walk(p, rel)
+    }
+  }
+  walk(root, '')
+  return out
+}
+
+/**
+ * Assert the shared tree still holds the state it was built in, one stat walk
+ * per case (~0.2s). `scratch` names the paths the case declared and already had
+ * restored; anything else that appeared, disappeared, changed size or kind, or
+ * was written since the build fails here, so a case can neither leak state into
+ * the next one nor write somewhere it did not declare.
+ */
+function assertSharedTreeIntact(scratch) {
+  const declared = new Set(scratch)
+  const seen = new Set()
+  const drifted = []
+  const walk = (abs, base) => {
+    for (const name of readdirSync(abs).sort()) {
+      const p = join(abs, name)
+      const rel = base ? base + '/' + name : name
+      const stat = lstatSync(p)
+      const isLink = stat.isSymbolicLink()
+      seen.add(rel)
+      const was = sharedStamp.get(rel)
+      if (!declared.has(rel)) {
+        if (was === undefined) drifted.push(rel + ' (unexpected)')
+        else if (stampOf(p) !== was.stamp) drifted.push(rel + ' (content)')
+        // A directory timestamp moves whenever a declared path inside it is
+        // restored (the full-build case moves market/dist aside and back), so
+        // only file writes are compared; a file added or removed is caught by
+        // the path-set assertions above.
+        else if (!isLink && !stat.isDirectory() && Math.abs(stat.mtimeMs - was.mtimeMs) > 1) drifted.push(rel + ' (written)')
+      }
+      if (!isLink && stat.isDirectory()) walk(p, rel)
+    }
+  }
+  walk(sharedDir, '')
+  assert.deepEqual([...seen].filter((rel) => !sharedStamp.has(rel)), [], 'a case left new paths in the shared fixture')
+  assert.deepEqual([...sharedStamp.keys()].filter((rel) => !seen.has(rel)), [], 'a case removed paths from the shared fixture')
+  assert.deepEqual(drifted, [], 'a case modified the shared fixture outside its declared scratch paths')
+}
+
+function snapshotPath(abs) {
+  if (!existsSync(abs)) return null
+  const stat = lstatSync(abs)
+  if (stat.isDirectory()) return { dir: true }
+  return { dir: false, bytes: readFileSync(abs), mtimeMs: stat.mtimeMs }
+}
+
+function restorePath(abs, snap) {
+  if (snap === null) {
+    rmSync(abs, { recursive: true, force: true })
+    return
+  }
+  if (snap.dir) return
+  writeFileSync(abs, snap.bytes)
+  // Put the timestamp back too: the next case's guard compares against the
+  // build-time stamp, and a restored file must look untouched, not rewritten.
+  utimesSync(abs, snap.mtimeMs / 1000, snap.mtimeMs / 1000)
+}
+
+/**
+ * Borrow the shared fixture for one case. `scratch` lists every path relative to
+ * the fixture root the case may create, modify or delete; those bytes are
+ * snapshotted first and put back in a cleanup hook, which runs even when the
+ * case fails, and the tree is then verified against its build stamp. A case
+ * therefore cannot hand its state to the next one — the isolation the per-case
+ * private copy used to provide — and a case that writes somewhere it did not
+ * declare fails here by name instead of silently corrupting a later case.
+ */
+/**
+ * market-build --check materializes its comparison tree here and removes it on
+ * every path that reaches the comparison, but a rejection raised after that emit
+ * (verifyTryonManifest on an undeclared tryon file) leaves it behind. It used to
+ * disappear with the per-case copy, so the shared tree clears it after each case.
+ */
+const CHECK_ARTIFACT = '.market-check-tmp'
+
+function borrowFixture(t, scratch) {
+  const held = [CHECK_ARTIFACT, ...scratch].map((rel) => [rel, snapshotPath(join(sharedDir, rel))])
+  const declared = [CHECK_ARTIFACT, ...scratch]
+  t.after(() => {
+    for (const [rel, snap] of held) restorePath(join(sharedDir, rel), snap)
+    assertSharedTreeIntact(declared)
+  })
+  return sharedDir
+}
+
+/**
+ * Borrow the shared fixture for the one case that runs a full build: that build
+ * rewrites every file under market/dist, so the dist is moved aside first and a
+ * copy of it is handed to the case, keeping the remaining 36k-file input cache
+ * shared. The move keeps the original dist inodes untouched, so the cleanup
+ * hook restores the exact tree the other cases read.
+ */
+function borrowWritableDist(t, body) {
+  const dist = join(sharedDir, 'market', 'dist')
+  const hold = join(sharedDir, '.dist-hold')
+  renameSync(dist, hold)
+  cpSync(hold, dist, { recursive: true })
+  materializations.distOnly += 1
+  t.after(() => {
+    rmSync(dist, { recursive: true, force: true })
+    renameSync(hold, dist)
+    assertSharedTreeIntact()
+  })
+  return body(dist)
 }
 
 function runCheck(dir) {
   return spawnSync(process.execPath, ['scripts/market-build', '--check'], { cwd: dir, encoding: 'utf8' })
 }
+
+before(() => {
+  if (!hasInputs) return
+  sharedDir = newFixtureDir()
+  sharedStamp = stampTree(sharedDir)
+})
+
+after(() => {
+  if (sharedDir === null) return
+  rmSync(sharedDir, { recursive: true, force: true })
+  sharedDir = null
+})
 
 const SKINS_SUBMODULE = 'satellites/dsh-skins'
 const GITMODULES_NAME = '.gitmodules'
@@ -104,6 +275,9 @@ function pinSkins(dir, pinSha) {
   git('update-index', '--add', '--cacheinfo', '160000,' + pinSha + ',' + SKINS_SUBMODULE)
 }
 
+/** Every path the pin guard's fixture branch adds to the shared tree. */
+const PIN_SCRATCH = [GITMODULES_NAME, 'market-inputs.lock.json', join('.market-inputs', 'skins.sha'), 'satellites', '.git']
+
 /** sha256 of every file under a tree, keyed by path relative to it. */
 function treeDigest(root) {
   const out = {}
@@ -121,14 +295,10 @@ function treeDigest(root) {
 
 test('clean checkout (no shell dist) passes market-build --check', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    const result = runCheck(dir)
-    assert.equal(result.status, 0, result.stderr)
-    assert.match(result.stdout, /dist up to date/)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  const dir = borrowFixture(t, [])
+  const result = runCheck(dir)
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /dist up to date/)
 })
 
 /**
@@ -140,115 +310,102 @@ test('clean checkout (no shell dist) passes market-build --check', (t) => {
  */
 test('full build without the shell dist leaves the committed tryon tree intact', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    const before = treeDigest(join(dir, 'market', 'dist', 'tryon'))
+  borrowWritableDist(t, (dist) => {
+    const dir = sharedDir
+    const before = treeDigest(join(dist, 'tryon'))
     assert.ok(Object.keys(before).length > 0, 'fixture must carry a committed tryon tree')
     const result = spawnSync(process.execPath, ['scripts/market-build'], { cwd: dir, encoding: 'utf8' })
     assert.equal(result.status, 0, result.stderr)
     // The notice is a console.warn, so it lands on stderr.
     assert.match(result.stderr, /tryon\/ left as-is/)
-    assert.deepEqual(treeDigest(join(dir, 'market', 'dist', 'tryon')), before)
+    assert.deepEqual(treeDigest(join(dist, 'tryon')), before)
     // No preserve directory may be left behind by the rewrite.
     assert.deepEqual(
       readdirSync(dir).filter((name) => name.startsWith('.tryon-preserve-')),
       [],
     )
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  })
 })
 
 test('check refuses tampered tryon-assets output', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    appendFileSync(join(dir, 'market', 'dist', 'tryon-assets', 'skins', 'blue-fantasy', 'skin.css'), '\ntampered{}')
-    const result = runCheck(dir)
-    assert.equal(result.status, 1)
-    assert.match(result.stderr, /tryon-assets\/skins\/blue-fantasy\/skin\.css/)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  const dir = borrowFixture(t, [join('market', 'dist', 'tryon-assets', 'skins', 'blue-fantasy', 'skin.css')])
+  appendFileSync(join(dir, 'market', 'dist', 'tryon-assets', 'skins', 'blue-fantasy', 'skin.css'), '\ntampered{}')
+  const result = runCheck(dir)
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /tryon-assets\/skins\/blue-fantasy\/skin\.css/)
 })
 
 test('check rejects an editor pick that names a missing catalog asset', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    writeFileSync(join(dir, 'market', 'editor-picks.json'),
-      JSON.stringify({ items: [{ kind: 'skin', id: 'no-such-skin' }] }))
-    const result = runCheck(dir)
-    assert.equal(result.status, 1)
-    assert.match(result.stderr, /editor picks #0: skin:no-such-skin is not in the skin catalog/)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  const dir = borrowFixture(t, [join('market', 'editor-picks.json')])
+  writeFileSync(join(dir, 'market', 'editor-picks.json'),
+    JSON.stringify({ items: [{ kind: 'skin', id: 'no-such-skin' }] }))
+  const result = runCheck(dir)
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /editor picks #0: skin:no-such-skin is not in the skin catalog/)
 })
 
 test('check rejects an editor pick outside the skin / pet / plugin kinds', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    writeFileSync(join(dir, 'market', 'editor-picks.json'),
-      JSON.stringify({ items: [{ kind: 'preset', id: 'demo' }] }))
-    const result = runCheck(dir)
-    assert.equal(result.status, 1)
-    assert.match(result.stderr, /editor picks #0: kind must be one of skin \/ pet \/ plugin/)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  const dir = borrowFixture(t, [join('market', 'editor-picks.json')])
+  writeFileSync(join(dir, 'market', 'editor-picks.json'),
+    JSON.stringify({ items: [{ kind: 'preset', id: 'demo' }] }))
+  const result = runCheck(dir)
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /editor picks #0: kind must be one of skin \/ pet \/ plugin/)
 })
 
 test('check refuses to compare dist against a cache that is off the pin', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    const pinned = 'a'.repeat(40)
-    const stale = 'b'.repeat(40)
-    pinSkins(dir, pinned)
-    writeFileSync(join(dir, '.market-inputs', 'skins.sha'), stale + '\n')
+  const dir = borrowFixture(t, PIN_SCRATCH)
+  const pinned = 'a'.repeat(40)
+  const stale = 'b'.repeat(40)
+  pinSkins(dir, pinned)
+  writeFileSync(join(dir, '.market-inputs', 'skins.sha'), stale + '\n')
 
-    // Given a cache holding a different commit than the gitlink, When the gate
-    // checks dist, Then it fails on the pin rather than reporting dist as stale
-    // and naming files to commit: rebuilding from that cache would bake unpinned
-    // content into the committed dist.
-    const result = runCheck(dir)
-    assert.equal(result.status, 1)
-    assert.match(result.stderr, /skins: stale/)
-    assert.match(result.stderr, /market-fetch-inputs/)
-    assert.doesNotMatch(result.stderr, /dist stale/)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  // Given a cache holding a different commit than the gitlink, When the gate
+  // checks dist, Then it fails on the pin rather than reporting dist as stale
+  // and naming files to commit: rebuilding from that cache would bake unpinned
+  // content into the committed dist.
+  const result = runCheck(dir)
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /skins: stale/)
+  assert.match(result.stderr, /market-fetch-inputs/)
+  assert.doesNotMatch(result.stderr, /dist stale/)
 })
 
 test('check proceeds to the dist comparison when the cache is on the pin', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    const pinned = 'c'.repeat(40)
-    pinSkins(dir, pinned)
-    writeFileSync(join(dir, '.market-inputs', 'skins.sha'), pinned + '\n')
+  const dir = borrowFixture(t, PIN_SCRATCH)
+  const pinned = 'c'.repeat(40)
+  pinSkins(dir, pinned)
+  writeFileSync(join(dir, '.market-inputs', 'skins.sha'), pinned + '\n')
 
-    // Given the cache matches the gitlink, When the gate checks dist, Then the
-    // pin guard stays out of the way and the comparison itself decides.
-    const result = runCheck(dir)
-    assert.doesNotMatch(result.stderr, /not at the pinned commits/)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  // Given the cache matches the gitlink, When the gate checks dist, Then the
+  // pin guard stays out of the way and the comparison itself decides.
+  const result = runCheck(dir)
+  assert.doesNotMatch(result.stderr, /not at the pinned commits/)
 })
 
 test('check rejects undeclared files inside the committed tryon dir', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
-  const dir = fixture()
-  try {
-    writeFileSync(join(dir, 'market', 'dist', 'tryon', 'rogue.js'), 'rogue')
-    const result = runCheck(dir)
-    assert.equal(result.status, 1)
-    assert.match(result.stderr, /extra: rogue\.js/)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  const dir = borrowFixture(t, [join('market', 'dist', 'tryon', 'rogue.js')])
+  writeFileSync(join(dir, 'market', 'dist', 'tryon', 'rogue.js'), 'rogue')
+  const result = runCheck(dir)
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /extra: rogue\.js/)
+})
+
+/**
+ * The guard for the sharing above: the 36k-file input cache is materialized
+ * once for the whole file, and the only other traversal is the one dist copy
+ * the full-build case needs. A timing budget would be machine-sensitive, so the
+ * assertion counts the materializations instead — re-introducing a per-case
+ * fixture, or a second full copy anywhere, fails here.
+ */
+test('the expensive committed tree is materialized once for the whole file', () => {
+  if (!hasInputs) return t.skip(SKIP_REASON)
+  assert.equal(materializations.shared, 1)
+  assert.equal(materializations.distOnly, 1)
 })
