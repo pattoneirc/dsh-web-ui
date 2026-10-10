@@ -22,17 +22,25 @@ So the intuitively expensive part (the 4,678-file dist) was about 15% of the cos
 - The one case that runs a full build rewrites every file under `market/dist`, so it cannot borrow the shared tree directly: `borrowWritableDist` renames the shared dist aside, hands the case a copy of it, and renames the original back afterwards. The original dist inodes are never written, and the 36k-file input cache stays shared, so the case costs one 1.3s dist copy instead of a 9s full materialization.
 - `market-build --check` materializes its comparison tree under `.market-check-tmp` and removes it on every path that reaches the comparison, but a rejection raised after that emit (`verifyTryonManifest` on an undeclared tryon file) leaves it behind. It used to disappear with the per-case copy, so the shared tree clears it after each case.
 - A final case asserts the materialization counters: the shared tree was built exactly once, and the only other traversal is the single dist copy. The guard is a count, not a time budget, because the repository has no timing calibration and a budget would be machine-sensitive.
+- The materialization skips a package manager cache (`node_modules`) inside the fetched community directory. That directory is read as a single JSON file (`community.json`, `scripts/market-build:87`), so the gate never walks it, while a local install there added 29,458 files to a developer checkout's copy. The skin, pet and preset directories are walked by the gate (`listFiles`), so nothing is filtered there, and the guard asserts both halves of the exclusion: no `node_modules` under the community input, and the `community.json` the gate does read is present.
+- The materialization guard takes its test context, so the path where `.market-inputs` is absent — every lane that runs `pnpm test:scripts` without fetching inputs — skips the cases instead of failing on an undefined context.
 
 Isolation is preserved by construction, not by convention: the restore runs in an after hook on failure, and the stamp check turns any undeclared drift into a failing assertion naming the path.
 
 ## Measured
 
-Same working tree and window, pre-change versus post-change:
+`node --test scripts/market-build-clean.test.mjs`, alternating pre-change and post-change samples in one window, three samples each side:
 
-- `node --test scripts/market-build-clean.test.mjs`: 99.27s pre-change (8 cases, one fixture each) versus 24.36s post-change (8 cases sharing one fixture plus the single dist copy) — 4.1x on the file.
-- `pnpm test:scripts`: 67.36s median (three samples, 67.04/67.36/76.81) pre-change versus 27.5s single-sample smoke post-change; 383 of 383 tests pass in both.
+| fetched input cache | before | after |
+| --- | --- | --- |
+| 3,793 files (a fetched checkout) | 13.40 / 13.56 / 14.25s, median 13.56s | 13.98 / 13.68 / 14.42s, median 13.98s |
+| 33,252 files (a checkout whose community input carries a package manager cache) | 30.60 / 28.74 / 29.28s, median 29.28s | 13.75 / 14.81 / 15.53s, median 14.81s |
 
-The 32s gap the file-level comparison once predicted is smaller in practice because the check runs and the fixture cleanup remain.
+The first row is where the sharing lands: one fixture instead of eight took the file from 99.27s to about 24s when the cache was 35k files, and the later exclusion brought the polluted-cache case to the same 15s as a clean cache — a no-filter control run on the same tree took 26.06s, which is where the second row's saving comes from. With an unfetched cache the whole file skips in about 0.1s.
+
+`pnpm test:scripts`: 384 of 384 tests pass with the change, on a 16.5s run in the fetched-cache worktree.
+
+What remains inside the file is the gate's own work: four cases run a full `market-build --check` (about 2.1-2.6s each, each emitting the comparison tree and hashing the 529MB dist twice), the full-build case copies the dist once (2.75s), the three cases that reject early cost about 0.2s each, and setup plus teardown cost about 3s. Shrinking that further means changing `scripts/market-build` or trimming the fixture's content, and both would weaken what the gate proves.
 
 ## Alternatives considered
 
@@ -51,7 +59,9 @@ The eight cases now share one tree, so a new case must declare its scratch paths
 
 `node --test scripts/market-build-clean.test.mjs` passes 9 of 9 (eight cases plus the materialization guard). Two negative controls were run against a symlinked copy of the checkout under `/tmp`, so no repository state was touched:
 
-- The pre-change file (from `HEAD`) with the new materialization guard appended fails that guard with `actual: 8`, while its eight original cases still pass — the guard can fail.
-- The post-change file with one undeclared write injected into a case passes that case's own assertions and then fails the isolation guard with `scripts/scratch.txt` named — the isolation guard can fail.
+- The pre-sharing file with the materialization guard appended fails that guard with `actual: 8`, while its eight original cases still pass — the guard can fail.
+- The current file with one undeclared write injected into a case passes that case's own assertions and then fails the isolation guard with `scripts/scratch.txt` named — the isolation guard can fail.
+- The current file with the community filter removed, run against a checkout that carries the cache, passes its eight cases and fails the guard on the `node_modules` assertion — the exclusion is asserted, not assumed.
+- The current file in a checkout without `.market-inputs` reports nine skipped tests and no failure, where the callback that ignored its test context reported `ReferenceError: t is not defined` — the skip path every unfetched lane takes is covered.
 
 `pnpm test:scripts` (383 tests), `pnpm test:standards`, `pnpm typecheck`, `pnpm emoji:check` and `pnpm docs:check` all pass with the change.

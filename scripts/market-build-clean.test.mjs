@@ -4,7 +4,7 @@ import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, 
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync, spawnSync } from 'node:child_process'
 
@@ -47,7 +47,12 @@ function copyCommittedTree(dir) {
     // runtime.
     [join(INPUTS, 'skins'), join(dir, '.market-inputs', 'skins')],
     [join(INPUTS, 'pet'), join(dir, '.market-inputs', 'pet')],
-    [join(INPUTS, 'community'), join(dir, '.market-inputs', 'community')],
+    // The community index is read as a single JSON file (community.json), so the
+    // gate never walks this directory — and a package manager cache left in it by
+    // a local install costs tens of thousands of files to copy for nothing. The
+    // skin, pet and preset directories are walked by the gate (listFiles), so
+    // nothing is filtered there.
+    [join(INPUTS, 'community'), join(dir, '.market-inputs', 'community'), { filter: (src) => basename(src) !== 'node_modules' }],
     [join(INPUTS, 'presets'), join(dir, '.market-inputs', 'presets')],
     // Published packages the aggregate depends on. market-build resolves them
     // through the dependency tree; the fixture has no node_modules, so the
@@ -59,9 +64,9 @@ function copyCommittedTree(dir) {
     // cap from it to reject catalog assets the installer could not install.
     [join(ROOT, 'packages', 'dsh-market', 'src', 'core', 'installer.ts'), join(dir, 'packages', 'dsh-market', 'src', 'core', 'installer.ts')],
   ]
-  for (const [from, to] of pairs) {
+  for (const [from, to, options] of pairs) {
     mkdirSync(dirname(to), { recursive: true })
-    cpSync(from, to, { recursive: true })
+    cpSync(from, to, { recursive: true, ...options })
   }
   // Resolve the skin-center lib imports exactly as a pnpm checkout would.
   // A workspace link keeps its dependencies inside the package; a registry
@@ -404,8 +409,13 @@ test('check rejects undeclared files inside the committed tryon dir', (t) => {
  * assertion counts the materializations instead — re-introducing a per-case
  * fixture, or a second full copy anywhere, fails here.
  */
-test('the expensive committed tree is materialized once for the whole file', () => {
+test('the expensive committed tree is materialized once for the whole file', (t) => {
   if (!hasInputs) return t.skip(SKIP_REASON)
   assert.equal(materializations.shared, 1)
   assert.equal(materializations.distOnly, 1)
+  // The fetched community directory is read through its index file alone, so a
+  // package manager cache left there by a local install is not materialized;
+  // the index the gate does read must still be present.
+  assert.equal(existsSync(join(sharedDir, '.market-inputs', 'community', 'node_modules')), false)
+  assert.ok(existsSync(join(sharedDir, '.market-inputs', 'community', 'community.json')))
 })
