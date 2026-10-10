@@ -51,7 +51,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsdown",
+    "build": "tsc -b tsconfig.build.json && tsdown",
     "watch": "tsdown --watch",
     "prepare": "tsc -p tsconfig.build.json && tsdown",
     "test": "vitest run",

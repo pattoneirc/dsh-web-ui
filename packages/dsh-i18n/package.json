@@ -31,7 +31,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsdown",
+    "build": "tsc -b tsconfig.build.json && tsdown",
     "prepare": "tsdown",
     "watch": "tsdown --watch",
     "test": "vitest run",
@@ -49,7 +49,10 @@
     "vitest": "^4.1.8"
   },
   "files": [
-    "lib",
+    "lib/**/*.js",
+    "lib/**/*.js.map",
+    "lib/**/*.d.ts",
+    "lib/**/*.d.ts.map",
     "cordis.patch.yml",
     "README.md",
     "README.zh.md",
