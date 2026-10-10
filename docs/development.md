@@ -32,7 +32,7 @@ pnpm docs:check        # 文档一致性（链接 / README / i18n 配对）
 pnpm i18n:check        # 双语与第三语言俄语键集一致性及 CJK 泄漏审计
 pnpm emoji:check       # 手写源码无表情符号审计
 pnpm libs:check        # 校验已提交 lib/ 产物与源码指纹一致性
-pnpm coverage:check    # 覆盖率棘轮（Tier 2，整仓约一分钟）
+pnpm coverage:check    # 覆盖率棘轮（Tier 2，各包按核数有界并发跑，上限二）
 ```
 
 改动提交前至少跑 `pnpm typecheck && pnpm test && pnpm test:standards && pnpm docs:check && pnpm i18n:check`；涉及聚合包或市场时运行对应 `pnpm aggregate:check` / `pnpm market:check`；皮肤、宠物与社区插件索引的门禁在各自的独立仓运行；CI 会全量跑所有门禁。

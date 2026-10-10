@@ -2,6 +2,30 @@
 /**
  * Coverage ratchet for the dsh-web monorepo.
  *
+ * The fleet runs with a bounded number of packages in flight. Seventeen serial
+ * vitest launches spend most of their wall clock in process start-up and
+ * collection rather than in the CPU work of any one suite, so the runs overlap
+ * without changing what any of them measures. On a ten-core machine the
+ * interleaved comparison measured 56.8 s at one run in flight against 38.8 s at
+ * two, with two, three and four indistinguishable from each other (38.8 / 37.1
+ * / 38.5 s best-case samples) - the whole win is in the first overlap.
+ *
+ * The ceiling is two because each package run parallelizes internally. A run
+ * under the forks pool takes `availableParallelism - 1` workers, so on ten cores
+ * one package already holds about ten processes and the measured peaks for the
+ * whole fleet were 11 / 20 / 36 worker processes at one / two / four runs in
+ * flight. Two runs is already about twice the core count; four is nearly four
+ * times it, and that cost is not hypothetical: across every run observed here
+ * and by the reviewer, four in flight failed 4 of 12 times while one to three in
+ * flight failed 0 of 17 (Fisher two-tailed p = 0.021). Both failure modes are
+ * load-shaped rather than semantic - a 2 s abort-propagation budget in
+ * dsh-remote-web-ui and one live benchmark case in dsh-liangshen - so the gate
+ * buys its stability by not oversubscribing the machine, and a nightly ratchet
+ * that goes red on contention costs more than the seconds four runs would save.
+ * On a machine with fewer than three cores the plan degrades to one run at a
+ * time - exactly the serial behavior this replaced - so no small runner can be
+ * made slower.
+ *
  * Every package resolves vitest 4.x. The six packages that pin their own
  * vitest also declare their own @vitest/coverage-v8 at the same major; the root
  * devDependency serves the rest through Node resolution. Bumping a package's
@@ -23,9 +47,9 @@
  *   node scripts/coverage-gate.mjs --write-baseline    # re-record the baseline
  *   node scripts/coverage-gate.mjs [names...]          # scope to packages by name
  */
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { cpus, tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -110,25 +134,153 @@ export function coverageArgs(outDir) {
   ]
 }
 
+/** Hard ceiling on the output captured from one package run. */
+const MAX_OUTPUT_BYTES = 128 * 1024 * 1024
+
+/**
+ * Most package runs this gate will keep in flight at once.
+ *
+ * Two, not four: a run parallelizes its own suite across `availableParallelism
+ * - 1` workers, so two runs already hold about twice the core count on a ten-core
+ * machine, and the interleaved measurement put two, three and four in flight
+ * within noise of each other while four was the only setting that failed. Raise
+ * this only with a fresh measurement that shows the extra runs buying wall clock
+ * without buying failures.
+ */
+export const MAX_CONCURRENCY = 2
+
+/**
+ * How many package runs may be in flight at once on a machine with this many
+ * cores.
+ *
+ * One core is left to the parent process and the operating system, and the
+ * result is capped at {@link MAX_CONCURRENCY}. The floor is one, which is what
+ * matters for the small runners: on one or two cores the plan is a single run
+ * at a time, i.e. the serial behavior this gate used before, so a small CI
+ * machine can never be made slower by the change.
+ * @param cpuCount - core count; a non-finite or non-positive value plans serial.
+ * @returns the number of package runs to keep in flight, at least one.
+ */
+export function planConcurrency(cpuCount) {
+  const cores = Number.isFinite(cpuCount) && cpuCount >= 1 ? Math.floor(cpuCount) : 1
+  return Math.max(1, Math.min(cores - 1, MAX_CONCURRENCY))
+}
+
 /** Run one package's suite with coverage and return its metrics. */
 export function coverPackage(pkg) {
   const outDir = join(tmpdir(), 'dsh-coverage', pkg.name)
   rmSync(outDir, { recursive: true, force: true })
   mkdirSync(outDir, { recursive: true })
   const bin = join(pkg.dir, 'node_modules', '.bin', 'vitest')
-  if (!existsSync(bin)) return { ok: false, error: 'vitest is not installed in ' + pkg.rel }
-  const result = spawnSync(bin, coverageArgs(outDir), { cwd: pkg.dir, encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 })
-  const output = (result.stdout ?? '') + (result.stderr ?? '')
-  if (result.status !== 0) return { ok: false, error: 'vitest exited ' + result.status, output: tail(output) }
-  const summaryPath = join(outDir, 'coverage-summary.json')
-  if (!existsSync(summaryPath)) return { ok: false, error: 'no coverage summary was written', output: tail(output) }
-  let summary
-  try {
-    summary = JSON.parse(readFileSync(summaryPath, 'utf8'))
-  } catch (error) {
-    return { ok: false, error: 'unreadable coverage summary: ' + error.message }
+  if (!existsSync(bin)) return Promise.resolve({ ok: false, error: 'vitest is not installed in ' + pkg.rel })
+  return new Promise((resolve) => {
+    const child = spawn(bin, coverageArgs(outDir), { cwd: pkg.dir, stdio: ['ignore', 'pipe', 'pipe'] })
+    // The two streams stay separate so the captured text is stdout followed by
+    // stderr, byte for byte what the previous spawnSync call produced; merging
+    // them in arrival order would reorder a failure's evidence.
+    const stdout = []
+    const stderr = []
+    let bytes = 0
+    let overflowed = false
+    let settled = false
+    const collect = (sink) => (chunk) => {
+      if (overflowed) return
+      bytes += chunk.length
+      if (bytes > MAX_OUTPUT_BYTES) {
+        overflowed = true
+        child.kill()
+        return
+      }
+      sink.push(chunk)
+    }
+    child.stdout.on('data', collect(stdout))
+    child.stderr.on('data', collect(stderr))
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      resolve({ ok: false, error: 'vitest could not be started: ' + error.message })
+    })
+    child.on('close', (status) => {
+      if (settled) return
+      settled = true
+      const output = stdout.join('') + stderr.join('')
+      if (overflowed) return resolve({ ok: false, error: 'vitest output exceeded the capture cap', output: tail(output) })
+      if (status !== 0) return resolve({ ok: false, error: 'vitest exited ' + status, output: tail(output) })
+      const summaryPath = join(outDir, 'coverage-summary.json')
+      if (!existsSync(summaryPath)) return resolve({ ok: false, error: 'no coverage summary was written', output: tail(output) })
+      let summary
+      try {
+        summary = JSON.parse(readFileSync(summaryPath, 'utf8'))
+      } catch (error) {
+        return resolve({ ok: false, error: 'unreadable coverage summary: ' + error.message })
+      }
+      resolve({ ok: true, metrics: metricsFromSummary(summary), total: summary.total })
+    })
+  })
+}
+
+/**
+ * Run every package's coverage and collect the results, with at most
+ * `options.limit` runs in flight.
+ *
+ * Determinism is the point of this function's shape. A result is stored at its
+ * package's own index, never in arrival order, and `onProgress` is called in
+ * package order as the completed prefix becomes contiguous. Two runs that
+ * complete in different orders therefore produce the same `measured`, `totals`,
+ * `failures` and the same progress sequence; only the wall clock differs.
+ *
+ * A runner that throws is recorded as that package's failure rather than
+ * rejecting the fleet, so one broken runner can never leave the other packages
+ * unmeasured.
+ * @param packages - packages in report order.
+ * @param cover - one package's runner; injected so tests can control completion order.
+ * @param options - `limit` (in flight), `cpuCount` (used to plan `limit`), `onProgress(pkg, result)`.
+ * @returns measured metrics by name, raw totals by name, and failures in package order.
+ */
+export async function runPackages(packages, cover, options = {}) {
+  const limit = Math.max(1, options.limit ?? planConcurrency(options.cpuCount ?? cpus().length))
+  const onProgress = options.onProgress ?? (() => {})
+  const results = new Array(packages.length)
+  const done = new Array(packages.length).fill(false)
+  let next = 0
+  let reported = 0
+  const flush = () => {
+    while (reported < packages.length && done[reported]) {
+      onProgress(packages[reported], results[reported])
+      reported += 1
+    }
   }
-  return { ok: true, metrics: metricsFromSummary(summary), total: summary.total }
+  const worker = async () => {
+    while (next < packages.length) {
+      const index = next
+      next += 1
+      try {
+        results[index] = await cover(packages[index])
+      } catch (error) {
+        results[index] = { ok: false, error: 'coverage run threw: ' + (error?.message ?? String(error)) }
+      }
+      done[index] = true
+      flush()
+    }
+  }
+  const workers = []
+  for (let i = 0; i < Math.min(limit, packages.length); i += 1) workers.push(worker())
+  await Promise.all(workers)
+
+  const measured = {}
+  const totals = {}
+  const failures = []
+  for (let i = 0; i < packages.length; i += 1) {
+    const pkg = packages[i]
+    const result = results[i]
+    if (!result.ok) {
+      failures.push({ pkg, result })
+      continue
+    }
+    measured[pkg.name] = result.metrics
+    totals[pkg.name] = result.total
+  }
+  return { measured, totals, failures }
 }
 
 function tail(text, lines = 25) {
@@ -218,7 +370,7 @@ function formatTable(measured) {
   return rows.join('\n')
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2)
   if (args.includes('--help') || args.includes('-h')) {
     console.log('Usage: node scripts/coverage-gate.mjs [--report] [--write-baseline] [names...]\n\nRuns vitest coverage for every plugin package and compares the four metrics\n(lines, statements, functions, branches) against scripts/coverage-baseline.json.')
@@ -232,21 +384,17 @@ function main() {
     return 1
   }
 
-  const measured = {}
-  const totals = {}
-  const failures = []
-  for (const pkg of packages) {
-    process.stdout.write('[coverage] ' + pkg.name + ' ... ')
-    const result = coverPackage(pkg)
-    if (!result.ok) {
-      console.log('FAIL (' + result.error + ')')
-      failures.push({ pkg, result })
-      continue
-    }
-    console.log(METRICS.map((metric) => metric + ' ' + result.metrics[metric] + '%').join(' '))
-    measured[pkg.name] = result.metrics
-    totals[pkg.name] = result.total
-  }
+  // One line per package, emitted when the completed prefix reaches it, so the
+  // log stays in package order and reads exactly as the serial one did.
+  const { measured, totals, failures } = await runPackages(packages, coverPackage, {
+    onProgress: (pkg, result) => {
+      if (!result.ok) {
+        console.log('[coverage] ' + pkg.name + ' ... FAIL (' + result.error + ')')
+        return
+      }
+      console.log('[coverage] ' + pkg.name + ' ... ' + METRICS.map((metric) => metric + ' ' + result.metrics[metric] + '%').join(' '))
+    },
+  })
 
   for (const failure of failures) {
     console.log('')
@@ -303,4 +451,4 @@ function main() {
 }
 
 const invokedDirectly = process.argv[1] ? join(process.argv[1]) === SCRIPT_PATH : false
-if (invokedDirectly) process.exit(main())
+if (invokedDirectly) process.exit(await main())

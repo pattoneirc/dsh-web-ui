@@ -16,7 +16,7 @@ Status: implemented
 - 规则作用域按 lane 划分：packages/、tests/、desktop/ 下的业务行为测试受完整契约约束；scripts/ 存放仓库工具，其测试是纯函数的普通单测，因此只受机械规则约束。
 - 已记录的例外使用 "test-standards-allow: <原因>" 标记：写在同一行行尾，或写在文件头部注释块中，与既有 i18n-allow 约定一致。
 - scripts/emoji-audit.mjs 用经过评审、带单测的 Node 门禁取代内联 Python 表情符号步骤，本地以 pnpm emoji:check 运行。它保留相同的码点区间与排除目录，报 file:line:column 而非字符下标，并跳过任何非严格 UTF-8 的内容，因此工作区里未跟踪的视频渲染产物或打包 tarball 不会让它失败。
-- scripts/coverage-gate.mjs 是覆盖率棘轮：对每个插件包运行 vitest 覆盖率，把 lines / statements / functions / branches 逐包记入 scripts/coverage-baseline.json，任一指标低于记录值超过 0.5 个百分点即失败——插桩并非逐位稳定（两次完全相同的整仓运行在某个包上相差 0.04 个百分点）。全部包都解析到 vitest 4.x；六个自带 vitest 的包同时声明同主版本的 @vitest/coverage-v8，其余包由根 devDependency 经 Node 解析提供。运行时会传 --coverage.excludeAfterRemap，让排除规则同样作用于重映射后的源码：内联了第三方依赖的构建产物否则会把该依赖的未映射文件一起计入，@deepseek-ai/schemastery 与 cosmokit 就是这样在没有任何测试变化的情况下把 dsh-web-all 从约 92% 压到约 51%。
+- scripts/coverage-gate.mjs 是覆盖率棘轮：对每个插件包运行 vitest 覆盖率，把 lines / statements / functions / branches 逐包记入 scripts/coverage-baseline.json，任一指标低于记录值超过 0.5 个百分点即失败——插桩并非逐位稳定（两次完全相同的整仓运行在某个包上相差 0.04 个百分点）。全部包都解析到 vitest 4.x；六个自带 vitest 的包同时声明同主版本的 @vitest/coverage-v8，其余包由根 devDependency 经 Node 解析提供。运行时会传 --coverage.excludeAfterRemap，让排除规则同样作用于重映射后的源码：内联了第三方依赖的构建产物否则会把该依赖的未映射文件一起计入，@deepseek-ai/schemastery 与 cosmokit 就是这样在没有任何测试变化的情况下把 dsh-web-all 从约 92% 压到约 51%。整队同时在飞的包运行数不超过 MAX_CONCURRENCY，按核数计划为 min(核数 - 1, 2) 且不低于 1：单个包的运行本身已 fork 出「核数 - 1」个 worker，因此第二个包在飞时十核本机是 2.0 倍过订阅、四核 runner 上是 1.5 倍，而一到两核保持原有的串行行为。重叠换来的是进程启动与收集时间——十七次串行 vitest 启动的主要墙钟就花在这里；把上限放到四实测为 3.6 倍过订阅，并且十二次运行出现四次负载型失败，而上限更低时十九次运行零失败，因此上限取二。
 - ci.yml 现在会跑此前缺失的 pnpm i18n:check、新增的 pnpm test:standards，以及取代 Python heredoc 的 pnpm emoji:check。
 - .github/workflows/nightly.yml 是 Tier 2 lane：覆盖率棘轮加全量测试三连跑，后者用于区分「持续坏的测试」与「偶发 flake」。
 - docs/development.md 承载测试规则、基线机制、分层与失败路径审计清单；根说明列出新命令，并要求合入前执行 pnpm test:standards。
@@ -27,7 +27,7 @@ Status: implemented
 - 用行内容指纹或 diff 变更行来匹配违规。指纹在每次重排或格式化后都会变动，基于 diff 的判定又会让本地与 CI 语义分叉；按文件、按规则计数稳定，且各处运行结果一致。
 - 把规则做成 ESLint 规则（例如 vitest 插件）。仓库没有 ESLint 工具链，为 23 个包引入它比这六条规则本身更大；本仓库既有的做法是 scripts/ 下经过评审并带 node:test 单测的脚本，scripts/i18n-audit.mjs、scripts/verify-docs.mjs、scripts/lib-artifact-check.mjs 都是如此。
 - 把规则做成只报告不拦截。要解决的问题正是评审压力，而只报告的结果就是被忽略。
-- 每个 PR 都跑覆盖率棘轮。它要在插桩下重跑整个测试套件（十核本机 65.6 秒），而 PR lane 已经跑过一次套件；棘轮属于 Tier 2 工作，按夜与手动执行。
+- 每个 PR 都跑覆盖率棘轮。它要在插桩下重跑整个测试套件（十核本机约 35 秒），而 PR lane 已经跑过一次套件；棘轮属于 Tier 2 工作，按夜与手动执行。
 - 给 PR lane 加基于影响的测试选择。十核实测全仓测试 43.6 秒、全仓类型检查 27.2 秒，lane 的墙钟时间由 install 与 build 主导；引入受影响包依赖图等于为了几秒钟多维护一层映射。
 - 在 Tier 2 里加 dsh-market.com 线上契约检查。工坊客户端与市场 worker 同属本仓库、一起部署，线上形状检查主要是在重复验证我们自己的部署；真正独立的依赖是钉住版本的 @deepseek-ai SDK cohort 与 npm registry，已由 runtime-deps:check 与发布时的 registry 校验覆盖。
 - 在每个 manifest 里声明 @vitest/coverage-v8。只有六个自带 vitest 的包需要自己声明，根 devDependency 已经为其余 4.x 包解析到 provider；多出的条目纯粹是维护面。
@@ -44,9 +44,11 @@ Status: implemented
 - 升级某个包的 vitest 主版本现在必须在同一次改动里升级其覆盖率 provider；provider 不匹配会让 nightly 门禁大声失败，而不是静默不上报。
 - 表情符号门禁的排除集合现在也覆盖被 git 忽略的本地产物（coverage、playwright-report、test-results、.codegraph、.zcode、.pnpm-store、.wrangler、gui-test-screenshots），因此刚跑过 Playwright 的工作区与干净的 CI 检出报告一致。
 
+- 让包运行重叠会把祖父条款记录的任意等待置于争用之下：packages/dsh-remote-web-ui/tests/loopback-proxy.spec.ts 轮询它的两秒预算，dsh-liangshen 的实时 benchmark 用例也一样，两者在上限为四时都失败过、在更低上限下都没失败过——上限取二依据的就是这次测量。
+
 ## Testing
 
-- pnpm test:scripts 通过，新增三份测试：scripts/test-standards.test.mjs（27 个测试，覆盖扫描器、测试提取、六条规则、豁免、lane 划分与基线比较）、scripts/emoji-audit.test.mjs（11 个测试，覆盖码点规则、路径范围、行列上报与严格 UTF-8 门禁）、scripts/coverage-gate.test.mjs（16 个测试，覆盖指标提取、回归比较及其容差、加权总计、序列化、vitest 参数与包发现）。
+- pnpm test:scripts 通过，新增三份测试：scripts/test-standards.test.mjs（27 个测试，覆盖扫描器、测试提取、六条规则、豁免、lane 划分与基线比较）、scripts/emoji-audit.test.mjs（11 个测试，覆盖码点规则、路径范围、行列上报与严格 UTF-8 门禁）、scripts/coverage-gate.test.mjs（26 个测试，覆盖指标提取、回归比较及其容差、加权总计、序列化、vitest 参数、包发现、有界整队——结果顺序、进度顺序与在飞上限——以及上限常量）。
 - pnpm test:standards 对已记录的基线通过；一个加入任意等待与非角色标题的探针 spec 会以三组新违规失败，并指出具体行号。
 - 取代内联 Python 的 Node 表情符号门禁与其结果一致：两者扫描同样的手写源码并报告 0 处违规（Node 版补上了 Python 通过解码异常隐式获得的严格 UTF-8 跳过）。
 - pnpm coverage:check 跑完整个包群：17 个包，没有包无法产出覆盖率，基线即由该次运行写入。每个指标记录本机与 Linux runner 中较低的一侧，因为两处按宿主机条件跳过的套件（dsh 在 PATH 上的 benchmark 用例、已安装宿主的真实启动用例）在 runner 上都会跳过。
