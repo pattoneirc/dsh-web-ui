@@ -13,9 +13,6 @@ export const topLevelArgv = (): string[] => ['rev-parse', '--show-toplevel']
 /** `git rev-parse --abbrev-ref HEAD` — current branch ('HEAD' when detached). */
 export const headBranchArgv = (): string[] => ['rev-parse', '--abbrev-ref', 'HEAD']
 
-/** `git rev-parse --short HEAD` — short head id. */
-export const headShortArgv = (): string[] => ['rev-parse', '--short', 'HEAD']
-
 /** `git for-each-ref refs/heads --format=%(refname:short)%00%(HEAD)%00%(objectname)` — local branches. */
 export const forEachRefArgv = (): string[] => [
   'for-each-ref', 'refs/heads',
