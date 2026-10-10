@@ -98,9 +98,11 @@ rows:
 # 不加载（设置入口也不出现），在 设置 → 插件 → 插件管理 的聚合子行里逐个开启；
 # 开启即写入用户层 disabled:false 覆盖（优先于本默认），停用回写 disabled:true。
 # 锁定的核心行（compat/settings/plugin-manager）不可列入本清单。
+# liangshen 不列入本清单（2026-10-10 决策）：梁神模式是新会话首页的常驻模式开关，
+# 默认启动才让新装用户看到它；理由与取舍见 Agent Note
+# .agents/notes/implemented/architecture/2026-10-10-liangshen-row-enabled-by-default.md。
 inactive:
   - web-ui-ssh
-  - web-ui-liangshen
   - web-ui-skill-explorer
 # 归档设置入口（2026-09-15 原生优先决策）：dsh-session-archive 注册官方 section id
 # archived-sessions 与 order 25 接管该入口，把「原生恢复列表 + 家族批量归档/删除/

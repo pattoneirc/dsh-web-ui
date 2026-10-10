@@ -80,7 +80,7 @@ flowchart LR
     B -- "dsh plugin --profile web add link" --> C["web profile（hoisted 布局）"]
     C -- "web-ui-* 行逐条挂载" --> D["14 个仓内家族子包 + 4 个卫星仓外部行"]
     E["mount-once 防重：双源只注册一次"] -.-> D
-    F["inactive：ssh、liangshen、skill-explorer 出厂默认关闭"] -.-> D
+    F["inactive：ssh、skill-explorer 出厂默认关闭"] -.-> D
 ```
 
 ## 设置页槽位体系

@@ -4,6 +4,8 @@ Status: implemented
 
 修正（2026-09-24，见[移除本仓库的 Electron 桌面应用](../simplification/2026-09-24-remove-electron-desktop-app.zh.md)）：本仓库的 Electron 桌面应用已移除；根 README 的桌面章节改为官方桌面客户端。
 
+修正（2026-10-10，见[梁神模式行的默认状态](../architecture/2026-10-10-liangshen-row-enabled-by-default.zh.md)）：梁神模式在聚合包中默认启动，本笔记的 README 规则背后只剩救助模式一个出厂默认关闭的界面；根 README 仍未收录梁神模式章节。
+
 ## Problem
 
 根 README 展示了默认家族安装并不携带的三个界面：梁神模式与救助模式是出厂默认关闭的可选行（`aggregate.yml` 的 `inactive`），外部归档管理则完全没有随包分发。它们的功能章节、单独安装命令、npm 包行与来源登记都在宣传一次全新安装不会加载的能力。同一份文档里，本仓库自己的 Electron 桌面应用（内置运行时与全家桶的可安装 macOS / Windows 构建）只有「快速上手」中的三步说明，而那条说明让读者执行 `dsh plugin --profile desktop add @linxin666/dsh-web-all@latest`。应用从不读取 `desktop` profile：它播种并运行的是 `$DSH_HOME/profiles/web`，因此该指引安装进了一个应用不使用的 profile。

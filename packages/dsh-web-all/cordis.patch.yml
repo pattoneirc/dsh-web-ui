@@ -117,8 +117,6 @@
 # plugin manager, whose enable writes a user-layer "disabled: false" override that wins.
 - id: web-ui-ssh
   disabled: true
-- id: web-ui-liangshen
-  disabled: true
 - id: web-ui-skill-explorer
   disabled: true
 
