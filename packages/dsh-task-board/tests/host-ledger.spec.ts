@@ -158,6 +158,36 @@ describe('HostTaskLedger', () => {
     expect(notified).toBe(2)
   })
 
+  it('user gets a private tasks array from a board read, so rewriting it cannot change the ledger', () => {
+    // Given a ledger holding one card
+    const ledger = new HostTaskLedger(tempRoot(), () => NOW)
+    ledger.applyRequest('seed-read-isolation', { kind: 'create', id: 'task-a', input: { title: 'A', description: '', prompt: '' } })
+
+    // When a consumer rewrites the array it was handed
+    const handedOut = ledger.state().tasks
+    handedOut.length = 0
+    handedOut.push(task('injected'))
+
+    // Then the ledger still reports its own card on the next read
+    expect(ledger.state().tasks.map(entry => entry.id)).toEqual(['task-a'])
+  })
+
+  it('user gets a fresh array on every board read while the cards stay the ledger records', () => {
+    // Given a ledger holding one card
+    const ledger = new HostTaskLedger(tempRoot(), () => NOW)
+    ledger.applyRequest('seed-read-identity', { kind: 'create', id: 'task-a', input: { title: 'A', description: '', prompt: '' } })
+
+    // When the board is read twice
+    const first = ledger.state().tasks
+    const second = ledger.state().tasks
+
+    // Then each read owns its collection while the card objects are the
+    // ledger's own records: a read hands out a container a caller cannot use to
+    // rewrite the board, and it no longer rebuilds the whole document to do it
+    expect(second).not.toBe(first)
+    expect(second[0]).toBe(first[0])
+  })
+
   it('persists atomically, restores revision, and returns the first duplicate request result', () => {
     const root = tempRoot()
     const ledger = new HostTaskLedger(root, () => NOW)
